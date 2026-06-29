@@ -68,7 +68,7 @@ exports.handler = async (event) => {
       const params = new URLSearchParams({
         'JobsFilterForm[jobStartDateBegin]': startDate,
         'JobsFilterForm[jobStartDateEnd]': endDate,
-        'JobsFilterForm[includeJobsWithNoDate]': '0',
+        'JobsFilterForm[includeJobsWithNoDate]': '1',
         'pageRecord': String(data.pageSize || 200),
         'page': String(data.page || 1),
         'sortField': data.sortField || '',
@@ -95,6 +95,9 @@ exports.handler = async (event) => {
         return { statusCode: res.status, headers: { ...CORS, 'Content-Type': 'application/json' }, body: JSON.stringify({ error: html.substring(0, 200) }) };
       }
 
+      if (data.debug) {
+        return { statusCode: 200, headers: { ...CORS, 'Content-Type': 'application/json' }, body: JSON.stringify({ rawHtml: html.substring(0, 3000) }) };
+      }
       const jobs = parseJobsHtml(html);
       return {
         statusCode: 200,
@@ -153,43 +156,31 @@ function parseJobsHtml(html) {
     const cell2 = tdBlocks[2];
     const cell3 = tdBlocks[3];
 
-    // --- Cell 0: date, job number, job ID, price, job type ---
-    // Date from SPAN.lead
     const dateSpanM = cell0.match(/<span[^>]*class="lead[^"]*"[^>]*>([\s\S]*?)<\/span>/i);
     const dateRaw = dateSpanM ? stripTags(dateSpanM[1]).trim() : '';
     const scheduledDate = dateRaw || 'Unscheduled';
 
-    // Job number and obfuscated ID from <a href="...jobView?id=XXX">#NUM</a>
     const jobLinkM = cell0.match(/<a[^>]*href="([^"]*jobView[?][^"]*)"[^>]*>([\s\S]*?)<\/a>/i);
     const jobId = jobLinkM ? (jobLinkM[1].match(/[?&]id=([^&"]+)/) || [])[1] || null : null;
     const jobNumber = jobLinkM ? stripTags(jobLinkM[2]).trim().replace(/^#/, '') : '';
 
-    // SPAN.muted in cell 0: "$price <br> date (created) <br> JobType"
     const mutedSpanM = cell0.match(/<span[^>]*class="muted"[^>]*>([\s\S]*?)<\/span>/i);
     const mutedText = mutedSpanM ? stripTags(mutedSpanM[1]).trim().replace(/\s+/g, ' ') : '';
-    // Price is first $xxx pattern
     const priceM = mutedText.match(/\$([\d,.]+)/);
     const price = priceM ? priceM[0] : '';
-    // Job type is typically the last non-date segment after "(created)"
     const afterCreated = mutedText.replace(/\$[\d,.]+\s*/g, '').replace(/\d{2}\/\d{2}\/\d{4}[^a-zA-Z]*/g, '').replace(/\(created\)/g, '').trim();
     const jobType = afterCreated || '';
 
-    // --- Cell 1: customer, address, description ---
-    // Customer from SPAN.lead
     const custSpanM = cell1.match(/<span[^>]*class="lead"[^>]*>([\s\S]*?)<\/span>/i);
     const custRaw = custSpanM ? stripTags(custSpanM[1]).trim().replace(/\s+/g, ' ') : '';
-    // Usually "LastName, FirstName  City ST Zip" — split on 2+ spaces or newline
     const custParts = custRaw.split(/\n|\s{2,}/);
     const customerName = custParts[0] ? custParts[0].trim() : custRaw;
     const cityState = custParts[1] ? custParts[1].trim() : '';
 
-    // Street from SPAN.muted in cell 1
     const cell1MutedM = cell1.match(/<span[^>]*class="muted"[^>]*>([\s\S]*?)<\/span>/i);
     const street = cell1MutedM ? stripTags(cell1MutedM[1]).trim().replace(/[()]/g, '').trim() : '';
     const address = [street, cityState].filter(Boolean).join(', ');
 
-    // Description: last plain <span> in cell 1 (no specific class, or class="")
-    // Find all spans, pick the last one that isn't lead/muted/additional-icons
     const allSpansInCell1 = [...cell1.matchAll(/<span([^>]*)>([\s\S]*?)<\/span>/gi)];
     let description = '';
     for (let s = allSpansInCell1.length - 1; s >= 0; s--) {
@@ -201,10 +192,7 @@ function parseJobsHtml(html) {
       }
     }
 
-    // --- Cell 2: tech ---
     const tech = stripTags(cell2).trim().replace(/\s+/g, ' ');
-
-    // --- Cell 3: status ---
     const status = stripTags(cell3).trim().replace(/\s+/g, ' ');
 
     if (jobId || jobNumber) {
@@ -234,4 +222,4 @@ function stripTags(html) {
     .replace(/&gt;/g, '>')
     .replace(/&nbsp;/g, ' ')
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
-}
+      }
