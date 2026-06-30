@@ -1,5 +1,6 @@
-// v10-fetchjobs-admin
-// Netlify serverless proxy for Service Fusion OAuth + API calls
+// v11-session-login
+// Netlify serverless proxy for Service Fusion OAuth + admin session login
+// fetchJobs does a full credential login to get a session cookie, then calls the admin portal
 exports.handler = async (event) => {
   const { httpMethod, queryStringParameters, headers, body } = event;
   const CORS = {
@@ -49,61 +50,118 @@ exports.handler = async (event) => {
     }
 
     if (data.action === 'fetchJobs') {
-      const token = data.token;
-      if (!token) return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: 'token required' }) };
+      // Credentials: from request body, or from Netlify env vars
+      const sfCompany  = data.sfCompany  || process.env.SF_COMPANY  || 'towergenerator';
+      const sfUsername = data.sfUsername || process.env.SF_USERNAME;
+      const sfPassword = data.sfPassword || process.env.SF_PASSWORD;
 
-      const today = new Date();
-      const fmt = (d) => {
-        const mm = String(d.getMonth()+1).padStart(2,'0');
-        const dd = String(d.getDate()).padStart(2,'0');
-        return mm+'/'+dd+'/'+d.getFullYear();
-      };
-      const daysBack = data.daysBack || 7;
-      const daysAhead = data.daysAhead || 30;
-      const startD = new Date(today); startD.setDate(today.getDate() - daysBack);
-      const endD = new Date(today); endD.setDate(today.getDate() + daysAhead);
-      const startDate = data.startDate || fmt(startD);
-      const endDate = data.endDate || fmt(endD);
+      if (!sfUsername || !sfPassword) {
+        return { statusCode: 400, headers: { ...CORS, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ error: 'SF credentials required. Set SF_USERNAME + SF_PASSWORD in Netlify env vars.' }) };
+      }
 
-      const params = new URLSearchParams({
-        'JobsFilterForm[jobStartDateBegin]': startDate,
-        'JobsFilterForm[jobStartDateEnd]': endDate,
-        'JobsFilterForm[includeJobsWithNoDate]': '1',
-        'pageRecord': String(data.pageSize || 200),
-        'page': String(data.page || 1),
-        'sortField': data.sortField || '',
-        'sortOrder': data.sortOrder || '',
+      const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+
+      // ââ Step 1: GET login page â CSRF token + initial cookies ââââââââââââââ
+      const pageRes = await fetch('https://auth.servicefusion.com/auth/login', {
+        headers: { Accept: 'text/html', 'User-Agent': UA },
       });
+      const pageHtml = await pageRes.text();
+      const pageCookies = getSetCookies(pageRes);
 
-      console.log('fetchJobs range:', startDate, '-', endDate);
+      const tokenMatch = pageHtml.match(/name="_token"\s+value="([^"]++"/);
+      if (!tokenMatch) {
+        return { statusCode: 500, headers: { ...CORS, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ error: 'No CSRF token on SF login page', preview: pageHtml.substring(0, 300) }) };
+      }
+      const csrfToken = tokenMatch[1];
+      console.log('CSRF ok, pageCookies:', pageCookies.length);
 
-      const res = await fetch('https://admin.servicefusion.com/jobs/fetchJobs', {
+      // ââ Step 2: POST credentials ââââââââââââââââââââââââââââââââââââââââââââ
+      const loginRes = await fetch('https://auth.servicefusion.com/auth/login', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
-          'Authorization': 'Bearer ' + token,
+          Cookie: cookieStr(pageCookies),
+          Accept: 'text/html,application/xhtml+xml',
+          'User-Agent': UA,
+          Referer: 'https://auth.servicefusion.com/auth/login',
+        },
+        body: new URLSearchParams({ _token: csrfToken, company: sfCompany, uid: sfUsername, pwd: sfPassword }).toString(),
+        redirect: 'manual',
+      });
+      const loginCookies = getSetCookies(loginRes);
+      console.log('login status:', loginRes.status, 'loginCookies:', loginCookies.length);
+
+      // status 302 = success; 200 = probably wrong credentials (redisplays form)
+      if (loginRes.status === 200) {
+        const errHtml = await loginRes.text();
+        return { statusCode: 401, headers: { ...CORS, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ error: 'SF login failed â check SF_USERNAME / SF_PASSWORD', preview: errHtml.substring(0, 200) }) };
+      }
+
+      // Merge cookies
+      const jar = mergeCookies([...pageCookies, ...loginCookies]);
+
+      // ââ Step 3: Follow redirect to pick up any admin-side cookies ââââââââââ
+      const location = loginRes.headers.get('location');
+      if (location) {
+        const adminRes = await fetch(location, {
+          headers: { Cookie: jarStr(jar), 'User-Agent': UA, Accept: 'text/html' },
+          redirect: 'manual',
+        });
+        mergeCookies(getSetCookies(adminRes), jar);
+        console.log('admin redirect status:', adminRes.status, 'extra cookies:', getSetCookies(adminRes).length);
+      }
+
+      // ââ Step 4: POST fetchJobs ââââââââââââââââââââââââââââââââââââââââââââââ
+      const today = new Date();
+      const fmt = (d) => String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0')+'/'+d.getFullYear();
+      const daysBack  = data.daysBack  || 7;
+      const daysAhead = data.daysAhead || 30;
+      const startD = new Date(today); startD.setDate(today.getDate() - daysBack);
+      const endD   = new Date(today);   endD.setDate(today.getDate() + daysAhead);
+      const startDate = data.startDate || fmt(startD);
+      const endDate   = data.endDate   || fmt(endD);
+
+      const params = new URLSearchParams({
+        'JobsFilterForm[jobStartDateBegin]':     startDate,
+        'JobsFilterForm[jobStartDateEnd]':       endDate,
+        'JobsFilterForm[includeJobsWithNoDate]': '1',
+        pageRecord: String(data.pageSize || 200),
+        page:       String(data.page || 1),
+        sortField:  data.sortField || '',
+        sortOrder:  data.sortOrder || '',
+      });
+      console.log('fetchJobs range:', startDate, '-', endDate);
+
+      const fetchRes = await fetch('https://admin.servicefusion.com/jobs/fetchJobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type':     'application/x-www-form-urlencoded',
+          Cookie:             jarStr(jar),
           'X-Requested-With': 'XMLHttpRequest',
-          'Accept': 'text/html,application/xhtml+xml,*/*',
+          Accept:             'text/html,application/xhtml+xml,*/*',
+          'User-Agent':       UA,
+          Referer:            'https://admin.servicefusion.com/jobs',
         },
         body: params.toString(),
       });
 
-      const html = await res.text();
-      console.log('fetchJobs status:', res.status, 'bodyLen:', html.length);
+      const html = await fetchRes.text();
+      console.log('fetchJobs status:', fetchRes.status, 'bodyLen:', html.length);
 
-      if (res.status !== 200) {
-        return { statusCode: res.status, headers: { ...CORS, 'Content-Type': 'application/json' }, body: JSON.stringify({ error: html.substring(0, 200) }) };
+      if (fetchRes.status !== 200) {
+        return { statusCode: fetchRes.status, headers: { ...CORS, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ error: html.substring(0, 300) }) };
       }
-
       if (data.debug) {
-        return { statusCode: 200, headers: { ...CORS, 'Content-Type': 'application/json' }, body: JSON.stringify({ rawHtml: html.substring(0, 3000) }) };
+        return { statusCode: 200, headers: { ...CORS, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rawHtml: html.substring(0, 4000) }) };
       }
       const jobs = parseJobsHtml(html);
-      return {
-        statusCode: 200,
-        headers: { ...CORS, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jobs, total: jobs.length })
-      };
+      return { statusCode: 200, headers: { ...CORS, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobs, total: jobs.length }) };
     }
 
     return { statusCode: 400, headers: CORS, body: 'Unknown action' };
@@ -127,99 +185,19 @@ exports.handler = async (event) => {
   return { statusCode: 405, headers: CORS, body: 'Method Not Allowed' };
 };
 
-// Cell structure discovered from admin portal:
-// Cell 0: SPAN.lead=date, A=job# (+href has obfuscated id), SPAN.muted="$price <br> date (created) <br> JobType"
-// Cell 1: SPAN.lead="CustomerName City ST Zip", SPAN.muted="(Street Address)", SPAN(last)="description"
-// Cell 2: tech name or "Unassigned"
-// Cell 3: status name
-
-function parseJobsHtml(html) {
-  const jobs = [];
-
-  // Split into <tr> blocks
-  const trParts = html.split(/<tr[\s>]/i);
-  for (let i = 1; i < trParts.length; i++) {
-    const rowHtml = trParts[i];
-    if (rowHtml.includes('<th')) continue;
-
-    // Extract <td> blocks
-    const tdBlocks = [];
-    const tdRe = /<td[^>]*>([\s\S]*?)<\/td>/gi;
-    let tdM;
-    while ((tdM = tdRe.exec(rowHtml)) !== null) {
-      tdBlocks.push(tdM[1]);
-    }
-    if (tdBlocks.length < 4) continue;
-
-    const cell0 = tdBlocks[0];
-    const cell1 = tdBlocks[1];
-    const cell2 = tdBlocks[2];
-    const cell3 = tdBlocks[3];
-
-    const dateSpanM = cell0.match(/<span[^>]*class="lead[^"]*"[^>]*>([\s\S]*?)<\/span>/i);
-    const dateRaw = dateSpanM ? stripTags(dateSpanM[1]).trim() : '';
-    const scheduledDate = dateRaw || 'Unscheduled';
-
-    const jobLinkM = cell0.match(/<a[^>]*href="([^"]*jobView[?][^"]*)"[^>]*>([\s\S]*?)<\/a>/i);
-    const jobId = jobLinkM ? (jobLinkM[1].match(/[?&]id=([^&"]+)/) || [])[1] || null : null;
-    const jobNumber = jobLinkM ? stripTags(jobLinkM[2]).trim().replace(/^#/, '') : '';
-
-    const mutedSpanM = cell0.match(/<span[^>]*class="muted"[^>]*>([\s\S]*?)<\/span>/i);
-    const mutedText = mutedSpanM ? stripTags(mutedSpanM[1]).trim().replace(/\s+/g, ' ') : '';
-    const priceM = mutedText.match(/\$([\d,.]+)/);
-    const price = priceM ? priceM[0] : '';
-    const afterCreated = mutedText.replace(/\$[\d,.]+\s*/g, '').replace(/\d{2}\/\d{2}\/\d{4}[^a-zA-Z]*/g, '').replace(/\(created\)/g, '').trim();
-    const jobType = afterCreated || '';
-
-    const custSpanM = cell1.match(/<span[^>]*class="lead"[^>]*>([\s\S]*?)<\/span>/i);
-    const custRaw = custSpanM ? stripTags(custSpanM[1]).trim().replace(/\s+/g, ' ') : '';
-    const custParts = custRaw.split(/\n|\s{2,}/);
-    const customerName = custParts[0] ? custParts[0].trim() : custRaw;
-    const cityState = custParts[1] ? custParts[1].trim() : '';
-
-    const cell1MutedM = cell1.match(/<span[^>]*class="muted"[^>]*>([\s\S]*?)<\/span>/i);
-    const street = cell1MutedM ? stripTags(cell1MutedM[1]).trim().replace(/[()]/g, '').trim() : '';
-    const address = [street, cityState].filter(Boolean).join(', ');
-
-    const allSpansInCell1 = [...cell1.matchAll(/<span([^>]*)>([\s\S]*?)<\/span>/gi)];
-    let description = '';
-    for (let s = allSpansInCell1.length - 1; s >= 0; s--) {
-      const attrs = allSpansInCell1[s][1];
-      const content = stripTags(allSpansInCell1[s][2]).trim();
-      if (!attrs.includes('lead') && !attrs.includes('muted') && !attrs.includes('additional') && content.length > 5) {
-        description = content;
-        break;
-      }
-    }
-
-    const tech = stripTags(cell2).trim().replace(/\s+/g, ' ');
-    const status = stripTags(cell3).trim().replace(/\s+/g, ' ');
-
-    if (jobId || jobNumber) {
-      jobs.push({
-        id: jobId || jobNumber,
-        number: jobNumber,
-        title: jobType || description || 'Job #' + jobNumber,
-        customer: customerName,
-        address,
-        tech,
-        status,
-        price,
-        date: scheduledDate,
-        notes: description,
-        job_type: jobType,
-      });
-    }
-  }
-  return jobs;
+// ââ Cookie helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+function getSetCookies(res) {
+  if (typeof res.headers.getSetCookie === 'function') return res.headers.getSetCookie();
+  const h = res.headers.get('set-cookie');
+  return h ? [h] : [];
 }
-
-function stripTags(html) {
-  return (html || '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
-      }
+// Merge array of Set-Cookie strings into a jar object (optionally into existing jar)
+function mergeCookies(cookies, jar = {}) {
+  cookies.forEach(c => {
+    const kv = c.split(';')[0];
+    const eq = kv.indexOf('=');
+    if (eq > 0) jar[kv.substring(0, eq).trim()] = kv.substring(eq + 1).trim();
+  });
+  return jar;
+}
+function jarStr(jar)   { return Object.entries(jar).map(([k,v]) => `${k}=${v}`).join
